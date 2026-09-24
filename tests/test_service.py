@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from robot_trials.clock import FrozenClock
-from robot_trials.errors import Conflict, Forbidden, InvalidState
+from robot_trials.errors import Conflict, Forbidden, InvalidState, NotFound
 from robot_trials.jsonio import load_json
 from robot_trials.service import TrialService
 
@@ -21,22 +21,27 @@ class ServiceTests(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
         self.service = TrialService(self.connection, self.clock)
+        self.service.create_user("admin", "组织管理员")
+        for user_id in ("operator", "stat", "approver", "auditor"):
+            self.service.create_user(user_id, user_id)
+        self.service.create_org("admin", "org-1", "事业部一")
+        self.service.create_team("admin", "org-1", "team-1", "递送试验组")
         for user_id, role in (
             ("operator", "operator"),
             ("stat", "statistician"),
             ("approver", "approver"),
             ("auditor", "auditor"),
         ):
-            self.service.create_user(user_id, user_id, role)
+            self.service.grant_membership("admin", "org-1", "team-1", user_id, role)
         self.protocol = load_json(ROOT / "fixtures" / "demo_protocol.json")
         self.rows = [
             json.loads(line)
             for line in (ROOT / "fixtures" / "demo_observations.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        self.service.register_robot("operator", "robot-a", "A 型", "厂商")
+        self.service.register_robot("operator", "org-1", "team-1", "robot-a", "A 型", "厂商")
         self.service.register_build("operator", "build-a", "robot-a", "1.0", "b" * 64)
-        self.service.publish_protocol("stat", self.protocol)
+        self.service.publish_protocol("stat", "org-1", "team-1", self.protocol)
         self.service.create_batch("operator", "batch-a", "demo-delivery-v1", 1, "build-a")
         self.service.start_batch("operator", "batch-a", 1)
 
@@ -47,7 +52,7 @@ class ServiceTests(unittest.TestCase):
         imported = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
         self.assertEqual(imported["inserted"], 6)
         self.service.seal_batch("stat", "batch-a", 2)
-        job = self.service.claim_job("worker", 30)
+        job = self.service.claim_job("stat", "org-1", "team-1", "worker", 30)
         analysis = self.service.complete_job("worker", job["job_id"], "stat")
         self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "满足规则")
         report = self.service.report("auditor", "batch-a")
@@ -99,21 +104,21 @@ class ServiceTests(unittest.TestCase):
     def test_failed_job_returns_to_queue_after_delay(self) -> None:
         self.service.import_observations("operator", "batch-a", "key-1", self.rows)
         self.service.seal_batch("stat", "batch-a", 2)
-        job = self.service.claim_job("worker-a", 10)
+        job = self.service.claim_job("stat", "org-1", "team-1", "worker-a", 10)
         failed = self.service.fail_job("worker-a", job["job_id"], "临时计算失败", retry_seconds=5)
         self.assertEqual(failed["state"], "queued")
-        self.assertIsNone(self.service.claim_job("worker-b", 10))
+        self.assertIsNone(self.service.claim_job("stat", "org-1", "team-1", "worker-b", 10))
         self.clock.advance(seconds=5)
-        retried = self.service.claim_job("worker-b", 10)
+        retried = self.service.claim_job("stat", "org-1", "team-1", "worker-b", 10)
         self.assertEqual(retried["job_id"], job["job_id"])
         self.assertEqual(retried["attempts"], 2)
 
     def test_lease_can_be_reclaimed_after_expiry(self) -> None:
         self.service.import_observations("operator", "batch-a", "key-1", self.rows)
         self.service.seal_batch("stat", "batch-a", 2)
-        first = self.service.claim_job("worker-a", 10)
+        first = self.service.claim_job("stat", "org-1", "team-1", "worker-a", 10)
         self.clock.advance(seconds=11)
-        second = self.service.claim_job("worker-b", 10)
+        second = self.service.claim_job("stat", "org-1", "team-1", "worker-b", 10)
         self.assertEqual(first["job_id"], second["job_id"])
         self.assertEqual(second["lease_owner"], "worker-b")
         with self.assertRaises(InvalidState):
