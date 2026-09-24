@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -18,69 +18,132 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS protocol_catalog (
-    protocol_id TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK (version > 0),
-    title TEXT NOT NULL,
-    task_family TEXT NOT NULL,
-    canonical_json TEXT NOT NULL,
-    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+CREATE TABLE IF NOT EXISTS organizations (
+    org_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS teams (
+    team_id TEXT NOT NULL,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    display_name TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (protocol_id, version),
-    UNIQUE (content_sha256)
+    PRIMARY KEY (org_id, team_id)
 );
 
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
 );
 
+-- 成员关系：team_id 非空表示团队内业务角色；team_id 为空表示组织级角色。
+-- 同一用户在同一团队只能持有一个角色，但可以在不同团队拥有不同角色。
+CREATE TABLE IF NOT EXISTS memberships (
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    team_id TEXT,
+    role TEXT NOT NULL CHECK (
+        role IN ('operator', 'statistician', 'approver', 'auditor', 'org_admin', 'org_auditor')
+    ),
+    granted_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, org_id, team_id, role),
+    FOREIGN KEY (org_id, team_id) REFERENCES teams(org_id, team_id),
+    CHECK (
+        (team_id IS NOT NULL AND role IN ('operator', 'statistician', 'approver', 'auditor'))
+        OR (team_id IS NULL AND role IN ('org_admin', 'org_auditor'))
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_role_per_user_team
+ON memberships(user_id, org_id, team_id)
+WHERE team_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_org_role_per_user
+ON memberships(user_id, org_id, role)
+WHERE team_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS memberships_team_idx
+ON memberships(org_id, team_id);
+
+CREATE TABLE IF NOT EXISTS protocol_catalog (
+    protocol_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    team_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    task_family TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, team_id, protocol_id, version),
+    FOREIGN KEY (org_id, team_id) REFERENCES teams(org_id, team_id),
+    UNIQUE (org_id, team_id, content_sha256)
+);
+
 CREATE TABLE IF NOT EXISTS robots (
-    robot_id TEXT PRIMARY KEY,
+    robot_id TEXT NOT NULL,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    team_id TEXT NOT NULL,
     model_name TEXT NOT NULL,
     vendor TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, team_id, robot_id),
+    FOREIGN KEY (org_id, team_id) REFERENCES teams(org_id, team_id)
 );
 
 CREATE TABLE IF NOT EXISTS builds (
-    build_id TEXT PRIMARY KEY,
-    robot_id TEXT NOT NULL REFERENCES robots(robot_id),
+    build_id TEXT NOT NULL,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    team_id TEXT NOT NULL,
+    robot_id TEXT NOT NULL,
     version TEXT NOT NULL,
     content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
     created_at TEXT NOT NULL,
-    UNIQUE (robot_id, version),
-    UNIQUE (content_sha256)
+    PRIMARY KEY (org_id, team_id, build_id),
+    FOREIGN KEY (org_id, team_id, robot_id) REFERENCES robots(org_id, team_id, robot_id),
+    UNIQUE (org_id, team_id, robot_id, version),
+    UNIQUE (org_id, team_id, content_sha256)
 );
 
 CREATE TABLE IF NOT EXISTS batches (
-    batch_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    team_id TEXT NOT NULL,
     protocol_id TEXT NOT NULL,
     protocol_version INTEGER NOT NULL,
-    build_id TEXT NOT NULL REFERENCES builds(build_id),
+    build_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('draft', 'running', 'sealed', 'analyzing', 'analyzed', 'decided')),
     revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
     created_by TEXT NOT NULL REFERENCES users(user_id),
     created_at TEXT NOT NULL,
     started_at TEXT,
     sealed_at TEXT,
-    FOREIGN KEY (protocol_id, protocol_version) REFERENCES protocol_catalog(protocol_id, version)
+    PRIMARY KEY (org_id, team_id, batch_id),
+    FOREIGN KEY (org_id, team_id) REFERENCES teams(org_id, team_id),
+    FOREIGN KEY (org_id, team_id, build_id) REFERENCES builds(org_id, team_id, build_id),
+    FOREIGN KEY (org_id, team_id, protocol_id, protocol_version)
+        REFERENCES protocol_catalog(org_id, team_id, protocol_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS observations (
     observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    team_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
     source_batch TEXT NOT NULL,
     source_row TEXT NOT NULL,
-    robot_id TEXT NOT NULL REFERENCES robots(robot_id),
+    robot_id TEXT NOT NULL,
     stratum_key TEXT NOT NULL,
     observed_at TEXT NOT NULL,
     metrics_json TEXT NOT NULL,
     content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
     imported_by TEXT NOT NULL REFERENCES users(user_id),
     imported_at TEXT NOT NULL,
-    UNIQUE (batch_id, source_batch, source_row)
+    FOREIGN KEY (org_id, team_id, batch_id) REFERENCES batches(org_id, team_id, batch_id),
+    FOREIGN KEY (org_id, team_id, robot_id) REFERENCES robots(org_id, team_id, robot_id),
+    UNIQUE (org_id, team_id, batch_id, source_batch, source_row)
 );
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
@@ -94,6 +157,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 
 CREATE TABLE IF NOT EXISTS exclusion_requests (
     exclusion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
     observation_id INTEGER NOT NULL REFERENCES observations(observation_id),
     status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'revoked')),
     reason TEXT NOT NULL,
@@ -110,7 +174,9 @@ WHERE status IN ('pending', 'approved');
 
 CREATE TABLE IF NOT EXISTS analysis_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    team_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
     batch_revision INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
@@ -120,12 +186,15 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE (batch_id, batch_revision)
+    FOREIGN KEY (org_id, team_id, batch_id) REFERENCES batches(org_id, team_id, batch_id),
+    UNIQUE (org_id, team_id, batch_id, batch_revision)
 );
 
 CREATE TABLE IF NOT EXISTS analyses (
     analysis_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    team_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
     batch_revision INTEGER NOT NULL,
     protocol_sha256 TEXT NOT NULL CHECK (length(protocol_sha256) = 64),
     input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
@@ -134,33 +203,49 @@ CREATE TABLE IF NOT EXISTS analyses (
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    UNIQUE (batch_id, batch_revision, input_sha256)
+    FOREIGN KEY (org_id, team_id, batch_id) REFERENCES batches(org_id, team_id, batch_id),
+    UNIQUE (org_id, team_id, batch_id, batch_revision, input_sha256)
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
     decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
-    analysis_id INTEGER NOT NULL REFERENCES analyses(analysis_id),
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    team_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    analysis_id INTEGER NOT NULL,
     decision TEXT NOT NULL CHECK (decision IN ('needs_more_data', 'approved', 'rejected')),
     reason TEXT NOT NULL,
     decided_by TEXT NOT NULL REFERENCES users(user_id),
     decided_at TEXT NOT NULL,
-    UNIQUE (batch_id, analysis_id)
+    FOREIGN KEY (org_id, team_id, batch_id) REFERENCES batches(org_id, team_id, batch_id),
+    UNIQUE (org_id, team_id, batch_id, analysis_id)
 );
 
+-- actor_role 冻结事件发生时的身份；成员关系事后被撤销也不改变历史记录。
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
     entity_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     actor_id TEXT NOT NULL,
+    actor_role TEXT NOT NULL,
+    org_id TEXT,
+    team_id TEXT,
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS audit_events_scope_idx
+ON audit_events(org_id, team_id, entity_type, entity_id);
+
+CREATE INDEX IF NOT EXISTS batches_scope_idx ON batches(org_id, team_id);
+CREATE INDEX IF NOT EXISTS observations_scope_idx ON observations(org_id, team_id, batch_id);
+CREATE INDEX IF NOT EXISTS jobs_scope_idx ON analysis_jobs(org_id, team_id, batch_id);
 """
 
 REQUIRED_TABLES = frozenset({
-    "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
+    "schema_meta", "organizations", "teams", "users", "memberships",
+    "protocol_catalog", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
 })

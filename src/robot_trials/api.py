@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .errors import ServiceError, ValidationFailed
 from .service import TrialService
@@ -19,7 +19,7 @@ from .storage import connect
 @dataclass(frozen=True, slots=True)
 class Response:
     status: int
-    body: Mapping[str, Any]
+    body: Mapping[str, Any] | list[Any]
 
 
 class JsonApplication:
@@ -47,71 +47,159 @@ class JsonApplication:
             raise ValidationFailed("请求体必须是 JSON 对象")
         return value
 
+    @staticmethod
+    def _scope(payload: dict[str, Any]) -> tuple[str, str]:
+        org_id = str(payload.get("org_id", "")).strip()
+        team_id = str(payload.get("team_id", "")).strip()
+        if not org_id or not team_id:
+            raise ValidationFailed("必须提供 org_id 与 team_id")
+        return org_id, team_id
+
+    @staticmethod
+    def _filters(query: str) -> tuple[str | None, str | None]:
+        params = parse_qs(query)
+        org = params.get("org_id", [None])[0]
+        team = params.get("team_id", [None])[0]
+        if team and not org:
+            raise ValidationFailed("按团队过滤时必须同时提供 org_id")
+        return org, team
+
     def handle(
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
-        path = urlparse(target).path.rstrip("/") or "/"
+        parsed = urlparse(target)
+        path = parsed.path.rstrip("/") or "/"
         parts = [part for part in path.split("/") if part]
+        actor = lambda: self._actor(normalized_headers)  # noqa: E731
         try:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
+
+            # -- 身份与组织治理 -------------------------------------------------
             if method == "POST" and path == "/users":
-                result = self.service.create_user(payload["user_id"], payload["display_name"], payload["role"])
+                result = self.service.create_user(
+                    payload["user_id"], payload["display_name"]
+                )
                 return Response(201, result)
+            if method == "POST" and path == "/organizations":
+                result = self.service.create_organization(
+                    payload["org_id"], payload["display_name"],
+                    payload["admin_user_id"], payload.get("admin_display_name"),
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "organizations" and parts[2] == "teams":
+                result = self.service.create_team(
+                    actor(), parts[1], payload["team_id"], payload["display_name"]
+                )
+                return Response(201, result)
+            if method == "POST" and path == "/memberships":
+                result = self.service.grant_membership(
+                    actor(), payload["user_id"], payload["org_id"],
+                    payload.get("team_id"), payload["role"],
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 2 and parts[0] == "memberships" and parts[1] == "revoke":
+                result = self.service.revoke_membership(
+                    actor(), payload["user_id"], payload["org_id"],
+                    payload.get("team_id"), payload["role"],
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "active":
+                result = self.service.set_user_active(
+                    actor(), payload["org_id"], parts[1], bool(payload["active"])
+                )
+                return Response(200, result)
+
+            # -- 列表与单项读取（按可见范围过滤） -------------------------------
+            if method == "GET" and path == "/robots":
+                org, team = self._filters(parsed.query)
+                return Response(200, self.service.list_robots(actor(), org, team))
+            if method == "GET" and path == "/builds":
+                org, team = self._filters(parsed.query)
+                return Response(200, self.service.list_builds(actor(), org, team))
+            if method == "GET" and path == "/protocols":
+                org, team = self._filters(parsed.query)
+                return Response(200, self.service.list_protocols(actor(), org, team))
+            if method == "GET" and path == "/batches":
+                org, team = self._filters(parsed.query)
+                return Response(200, self.service.list_batches(actor(), org, team))
+            if method == "GET" and len(parts) == 2 and parts[0] == "robots":
+                return Response(200, self.service.get_robot(actor(), parts[1]))
+            if method == "GET" and len(parts) == 2 and parts[0] == "builds":
+                return Response(200, self.service.get_build(actor(), parts[1]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "protocols":
+                query = parse_qs(parsed.query)
+                org = query.get("org_id", [None])[0]
+                team = query.get("team_id", [None])[0]
+                if not org or not team:
+                    raise ValidationFailed("读取协议必须提供 org_id 与 team_id")
+                return Response(
+                    200, self.service.get_protocol(actor(), org, team, parts[1], int(parts[2]))
+                )
+
+            # -- 业务写入 ------------------------------------------------------
             if method == "POST" and path == "/robots":
+                org_id, team_id = self._scope(payload)
                 result = self.service.register_robot(
-                    self._actor(normalized_headers), payload["robot_id"], payload["model_name"], payload["vendor"]
+                    actor(), org_id, team_id,
+                    payload["robot_id"], payload["model_name"], payload["vendor"],
                 )
                 return Response(201, result)
             if method == "POST" and path == "/builds":
+                org_id, team_id = self._scope(payload)
                 result = self.service.register_build(
-                    self._actor(normalized_headers), payload["build_id"], payload["robot_id"],
+                    actor(), org_id, team_id, payload["build_id"], payload["robot_id"],
                     payload["version"], payload["content_sha256"],
                 )
                 return Response(201, result)
             if method == "POST" and path == "/protocols":
-                return Response(201, self.service.publish_protocol(self._actor(normalized_headers), payload))
+                org_id, team_id = self._scope(payload)
+                return Response(
+                    201,
+                    self.service.publish_protocol(actor(), org_id, team_id, payload["protocol"]),
+                )
             if method == "POST" and path == "/batches":
+                org_id, team_id = self._scope(payload)
                 result = self.service.create_batch(
-                    self._actor(normalized_headers), payload["batch_id"], payload["protocol_id"],
+                    actor(), org_id, team_id, payload["batch_id"], payload["protocol_id"],
                     int(payload["protocol_version"]), payload["build_id"],
                 )
                 return Response(201, result)
+            if method == "GET" and len(parts) == 2 and parts[0] == "batches":
+                return Response(200, self.service.get_batch(actor(), parts[1]))
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "start":
-                result = self.service.start_batch(
-                    self._actor(normalized_headers), parts[1], int(payload["expected_revision"])
-                )
+                result = self.service.start_batch(actor(), parts[1], int(payload["expected_revision"]))
                 return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "observations":
+                return Response(200, self.service.list_observations(actor(), parts[1]))
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "observations":
                 key = normalized_headers.get("idempotency-key", "").strip()
                 if not key:
                     raise ValidationFailed("缺少 Idempotency-Key")
                 result = self.service.import_observations(
-                    self._actor(normalized_headers), parts[1], key, payload.get("observations", [])
+                    actor(), parts[1], key, payload.get("observations", [])
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "seal":
-                result = self.service.seal_batch(
-                    self._actor(normalized_headers), parts[1], int(payload["expected_revision"])
-                )
+                result = self.service.seal_batch(actor(), parts[1], int(payload["expected_revision"]))
                 return Response(200, result)
             if method == "GET" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "report":
-                return Response(200, self.service.report(self._actor(normalized_headers), parts[1]))
+                return Response(200, self.service.report(actor(), parts[1]))
             if method == "POST" and path == "/exclusions":
                 result = self.service.request_exclusion(
-                    self._actor(normalized_headers), int(payload["observation_id"]), payload["reason"]
+                    actor(), int(payload["observation_id"]), payload["reason"]
                 )
                 return Response(201, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "exclusions" and parts[2] == "review":
                 result = self.service.review_exclusion(
-                    self._actor(normalized_headers), int(parts[1]), bool(payload["approve"]), payload.get("note", "")
+                    actor(), int(parts[1]), bool(payload["approve"]), payload.get("note", "")
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "exclusions" and parts[2] == "revoke":
                 result = self.service.revoke_exclusion(
-                    self._actor(normalized_headers), int(parts[1]), payload["reason"]
+                    actor(), int(parts[1]), payload["reason"]
                 )
                 return Response(200, result)
             if method == "POST" and path == "/jobs/claim":
@@ -119,17 +207,18 @@ class JsonApplication:
                 return Response(200, {"job": result})
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
+                    payload["worker_id"], int(parts[1]), actor()
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
-                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
+                    payload["worker_id"], int(parts[1]), payload["error"],
+                    int(payload.get("retry_seconds", 0)),
                 )
                 return Response(200, result)
             if method == "POST" and path == "/decisions":
                 result = self.service.decide(
-                    self._actor(normalized_headers), payload["batch_id"], int(payload["analysis_id"]),
+                    actor(), payload["batch_id"], int(payload["analysis_id"]),
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)

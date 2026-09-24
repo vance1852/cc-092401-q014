@@ -12,6 +12,10 @@ from .service import TrialService
 from .storage import connect, inspect_schema
 
 
+ORG_ID = "demo-org"
+TEAM_ID = "demo-team"
+
+
 def run(workspace: Path) -> dict[str, object]:
     fixtures = workspace / "fixtures"
     protocol = load_json(fixtures / "demo_protocol.json")
@@ -25,14 +29,36 @@ def run(workspace: Path) -> dict[str, object]:
         connection = connect(database)
         try:
             service = TrialService(connection)
-            service.create_user("operator-1", "测试操作员", "operator")
-            service.create_user("stat-1", "统计负责人", "statistician")
-            service.create_user("approver-1", "准入审批人", "approver")
-            service.create_user("auditor-1", "审计人员", "auditor")
-            service.register_robot("operator-1", "robot-a", "A 型人形机器人", "示例厂商")
-            service.register_build("operator-1", "build-a1", "robot-a", "1.0.0", "a" * 64)
-            service.publish_protocol("stat-1", protocol)
-            service.create_batch("operator-1", "batch-demo", protocol["protocol_id"], protocol["version"], "build-a1")
+            for user_id, display_name in (
+                ("admin-1", "组织管理员"),
+                ("operator-1", "测试操作员"),
+                ("stat-1", "统计负责人"),
+                ("approver-1", "准入审批人"),
+                ("auditor-1", "团队审计人员"),
+                ("org-auditor-1", "组织审计人员"),
+            ):
+                service.create_user(user_id, display_name)
+            service.create_organization(ORG_ID, "示例事业部", "admin-1")
+            service.create_team("admin-1", ORG_ID, TEAM_ID, "递送试验团队")
+            for user_id, role in (
+                ("operator-1", "operator"),
+                ("stat-1", "statistician"),
+                ("approver-1", "approver"),
+                ("auditor-1", "auditor"),
+            ):
+                service.grant_membership("admin-1", user_id, ORG_ID, TEAM_ID, role)
+            service.grant_membership("admin-1", "org-auditor-1", ORG_ID, None, "org_auditor")
+            service.register_robot(
+                "operator-1", ORG_ID, TEAM_ID, "robot-a", "A 型人形机器人", "示例厂商"
+            )
+            service.register_build(
+                "operator-1", ORG_ID, TEAM_ID, "build-a1", "robot-a", "1.0.0", "a" * 64
+            )
+            service.publish_protocol("stat-1", ORG_ID, TEAM_ID, protocol)
+            service.create_batch(
+                "operator-1", ORG_ID, TEAM_ID, "batch-demo",
+                protocol["protocol_id"], protocol["version"], "build-a1",
+            )
             service.start_batch("operator-1", "batch-demo", 1)
             imported = service.import_observations(
                 "operator-1", "batch-demo", "demo-import-1", observation_rows
@@ -47,14 +73,19 @@ def run(workspace: Path) -> dict[str, object]:
                 "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
             )
             report = service.report("auditor-1", "batch-demo")
+            org_report = service.report("org-auditor-1", "batch-demo")
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
+    if org_report["viewer_role"] != "org_auditor":
+        raise RuntimeError("组织审计员应能跨团队只读报告")
     return {
         "status": "ok",
         "protocol": f"{protocol['protocol_id']}@{protocol['version']}",
+        "organization": ORG_ID,
+        "team": TEAM_ID,
         "observation_count": imported["inserted"],
         "analysis_id": analysis["analysis_id"],
         "input_sha256": analysis["input_sha256"],

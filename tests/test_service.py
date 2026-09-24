@@ -16,28 +16,39 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ServiceTests(unittest.TestCase):
+    ORG = "org-a"
+    TEAM = "team-a"
+
     def setUp(self) -> None:
         self.connection = sqlite3.connect(":memory:", isolation_level=None)
         self.connection.row_factory = sqlite3.Row
         self.clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
         self.service = TrialService(self.connection, self.clock)
+        self.service.create_user("admin", "管理员")
+        self.service.create_organization(self.ORG, "事业一部", "admin")
+        self.service.create_team("admin", self.ORG, self.TEAM, "试验团队")
         for user_id, role in (
             ("operator", "operator"),
             ("stat", "statistician"),
             ("approver", "approver"),
             ("auditor", "auditor"),
         ):
-            self.service.create_user(user_id, user_id, role)
+            self.service.create_user(user_id, user_id)
+            self.service.grant_membership("admin", user_id, self.ORG, self.TEAM, role)
         self.protocol = load_json(ROOT / "fixtures" / "demo_protocol.json")
         self.rows = [
             json.loads(line)
             for line in (ROOT / "fixtures" / "demo_observations.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        self.service.register_robot("operator", "robot-a", "A 型", "厂商")
-        self.service.register_build("operator", "build-a", "robot-a", "1.0", "b" * 64)
-        self.service.publish_protocol("stat", self.protocol)
-        self.service.create_batch("operator", "batch-a", "demo-delivery-v1", 1, "build-a")
+        self.service.register_robot("operator", self.ORG, self.TEAM, "robot-a", "A 型", "厂商")
+        self.service.register_build(
+            "operator", self.ORG, self.TEAM, "build-a", "robot-a", "1.0", "b" * 64
+        )
+        self.service.publish_protocol("stat", self.ORG, self.TEAM, self.protocol)
+        self.service.create_batch(
+            "operator", self.ORG, self.TEAM, "batch-a", "demo-delivery-v1", 1, "build-a"
+        )
         self.service.start_batch("operator", "batch-a", 1)
 
     def tearDown(self) -> None:

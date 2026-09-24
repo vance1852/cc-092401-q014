@@ -28,10 +28,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.body["error"]["code"], "validation_failed")
 
     def test_user_route(self) -> None:
-        payload = json.dumps({"user_id": "u1", "display_name": "操作员", "role": "operator"}).encode()
+        payload = json.dumps({"user_id": "u1", "display_name": "操作员"}).encode()
         response = self.app.handle("POST", "/users", body=payload)
         self.assertEqual(response.status, 201)
-        self.assertEqual(response.body["role"], "operator")
+        self.assertEqual(response.body["user_id"], "u1")
 
 
 if __name__ == "__main__":
